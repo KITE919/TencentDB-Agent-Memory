@@ -8,7 +8,8 @@
  * - Filter expressions for scalar field queries
  * - Time fields stored as uint64 epoch ms (ISO ↔ epoch conversion internal)
  *
- * All methods are fault-tolerant: return empty/false on error, never throw.
+ * Methods are fault-tolerant by default; deleteL1 can opt into throwing so
+ * the gateway can distinguish a store failure from a missing record.
  */
 
 import type { MemoryRecord } from "../../record/l1-writer.js";
@@ -759,14 +760,30 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async deleteL1(recordId: string): Promise<boolean> {
-    await this._ensureInit();
-    if (this.degraded) return false;
-    const affected = await this.client.deleteDoc(this.l1Collection, {
-      query: { documentIds: [recordId] },
-    });
-    return affected > 0;
-    // Note: No catch — exceptions propagate to caller (gateway) for proper error handling
+  async deleteL1(
+    recordId: string,
+    filter?: IsolationFilter,
+    opts?: { throwOnError?: boolean },
+  ): Promise<boolean> {
+    try {
+      await this._ensureInit();
+      if (this.degraded) {
+        if (opts?.throwOnError) throw new Error("deleteL1: store is degraded");
+        return false;
+      }
+      const filterExpr = joinFilter(buildIsolationConditions(filter));
+      const affected = await this.client.deleteDoc(this.l1Collection, {
+        query: {
+          documentIds: [recordId],
+          ...(filterExpr ? { filter: filterExpr } : {}),
+        },
+      });
+      return affected > 0;
+    } catch (err) {
+      if (opts?.throwOnError) throw err instanceof Error ? err : new Error(String(err));
+      this.logger?.warn(`${TAG} [L1-delete] FAILED id=${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
   }
 
   async deleteL1Batch(recordIds: string[]): Promise<boolean> {
